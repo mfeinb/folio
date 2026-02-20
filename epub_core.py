@@ -25,6 +25,13 @@ for prefix, uri in NS.items():
 
 
 @dataclass
+class ChapterInfo:
+    idref: str   # spine idref
+    title: str   # from NAV/NCX (empty if not found)
+    href: str    # content file href relative to OPF
+
+
+@dataclass
 class EpubMetadata:
     title: str = ""
     author: str = ""
@@ -366,3 +373,99 @@ class EpubEditor:
 
     def get_file_size(self) -> int:
         return self.path.stat().st_size if self.path.exists() else 0
+
+    def get_chapters(self) -> list[ChapterInfo]:
+        """Return spine items with titles resolved from the NAV/NCX document."""
+        title_map = self._parse_nav_titles()
+        chapters = []
+        for idref in self.metadata.spine_items:
+            item = self.metadata.manifest_items.get(idref, {})
+            href = item.get("href", "")
+            title = title_map.get(href, "")
+            chapters.append(ChapterInfo(idref=idref, title=title, href=href))
+        return chapters
+
+    def reorder_spine(self, new_idrefs: list[str]):
+        """Rewrite the OPF spine in the given order and update the in-memory list."""
+        self.metadata.spine_items = list(new_idrefs)
+        tree = ET.parse(self._opf_abs)
+        root = tree.getroot()
+
+        def tag(ns_prefix, local):
+            return f"{{{NS[ns_prefix]}}}{local}"
+
+        spine_el = root.find(tag("opf", "spine"))
+        if spine_el is None:
+            return
+        for itemref in spine_el.findall(tag("opf", "itemref")):
+            spine_el.remove(itemref)
+        for idref in new_idrefs:
+            itemref = ET.SubElement(spine_el, tag("opf", "itemref"))
+            itemref.set("idref", idref)
+        ET.indent(tree, space="  ")
+        tree.write(self._opf_abs, encoding="utf-8", xml_declaration=True)
+
+    def _parse_nav_titles(self) -> dict[str, str]:
+        """Return href → title mapping from the EPUB3 NAV or EPUB2 NCX."""
+        opf_dir = Path(self._opf_path).parent
+        # EPUB3: nav item
+        for info in self.metadata.manifest_items.values():
+            if "nav" in info.get("properties", ""):
+                nav_path = self._tmpdir / opf_dir / info["href"]
+                if nav_path.exists():
+                    result = self._parse_nav_html(nav_path)
+                    if result:
+                        return result
+        # EPUB2: NCX fallback
+        for info in self.metadata.manifest_items.values():
+            if info.get("media-type") == "application/x-dtbncx+xml":
+                ncx_path = self._tmpdir / opf_dir / info["href"]
+                if ncx_path.exists():
+                    return self._parse_ncx(ncx_path)
+        return {}
+
+    def _parse_nav_html(self, nav_path: Path) -> dict[str, str]:
+        """Parse an EPUB3 NAV document, returning href → title."""
+        result = {}
+        try:
+            soup = BeautifulSoup(
+                nav_path.read_text(encoding="utf-8", errors="replace"), "lxml"
+            )
+            for nav_el in soup.find_all("nav"):
+                epub_type = nav_el.get("epub:type", "")
+                if "toc" in epub_type:
+                    for a in nav_el.find_all("a", href=True):
+                        href = a["href"].split("#")[0]
+                        title = a.get_text(strip=True)
+                        if href and title:
+                            result[href] = title
+                    break
+            # Fallback: first nav if none matched epub:type
+            if not result:
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].split("#")[0]
+                    title = a.get_text(strip=True)
+                    if href and title:
+                        result[href] = title
+        except Exception:
+            pass
+        return result
+
+    def _parse_ncx(self, ncx_path: Path) -> dict[str, str]:
+        """Parse an EPUB2 NCX document, returning href → title."""
+        result = {}
+        try:
+            tree = ET.parse(ncx_path)
+            root = tree.getroot()
+            ns = {"ncx": "http://www.daisy.org/z3986/2005/ncx/"}
+            for point in root.findall(".//ncx:navPoint", ns):
+                content = point.find("ncx:content", ns)
+                label = point.find(".//ncx:text", ns)
+                if content is not None and label is not None:
+                    href = content.get("src", "").split("#")[0]
+                    title = (label.text or "").strip()
+                    if href and title:
+                        result[href] = title
+        except Exception:
+            pass
+        return result

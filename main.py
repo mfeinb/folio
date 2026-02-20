@@ -2,6 +2,7 @@
 """folio: terminal-native epub editor."""
 
 import sys
+import unicodedata
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -28,7 +29,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from epub_core import EpubEditor, EpubMetadata
+from epub_core import ChapterInfo, EpubEditor, EpubMetadata
 
 THEME_NAMES: list[str] = list(BUILTIN_THEMES.keys())
 
@@ -38,6 +39,47 @@ LOGO = """
 [bold cyan]  ╩  ╚═╝╩═╝╩╚═╝[/bold cyan]
 [dim]  epub editor · terminal-native[/dim]
 """
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _bidi(text: str) -> str:
+    """Visually reorder RTL text (Hebrew/Arabic) for display in LTR terminals."""
+    if not text:
+        return text
+    if not any(unicodedata.bidirectional(c) in ("R", "AL") for c in text):
+        return text
+    try:
+        from bidi.algorithm import get_display
+        return get_display(text)
+    except Exception:
+        return text
+
+
+def _render_cover_art(path: Path, width: int = 22, max_rows: int = 13) -> Text | None:
+    """Render an image as Unicode half-block art. Returns None on failure."""
+    try:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((width, max_rows * 2), Image.LANCZOS)
+        w, h = img.size
+        if h % 2 != 0:
+            h -= 1
+        pixels = img.load()
+        result = Text()
+        for row in range(h // 2):
+            for col in range(w):
+                r1, g1, b1 = pixels[col, row * 2]
+                r2, g2, b2 = pixels[col, row * 2 + 1]
+                result.append(
+                    "▀",
+                    style=f"#{r1:02x}{g1:02x}{b1:02x} on #{r2:02x}{g2:02x}{b2:02x}",
+                )
+            result.append("\n")
+        return result
+    except Exception:
+        return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -282,6 +324,256 @@ class ThemeScreen(ModalScreen[str | None]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Modal: Image browser (for cover selection)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ImageBrowserScreen(ModalScreen[str | None]):
+    CSS = """
+    ImageBrowserScreen { align: center middle; }
+    #img-dialog {
+        width: 82;
+        height: 32;
+        border: thick $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #img-path { color: $accent; height: 1; text-align: center; }
+    #img-body { height: 1fr; margin: 1 0 0 0; }
+    #img-list {
+        width: 1fr;
+        border: solid $primary-darken-2;
+        background: $surface-darken-1;
+    }
+    #img-list > ListItem { padding: 0 1; }
+    #img-list > ListItem.--highlight { background: $primary; color: $text; }
+    #img-preview {
+        width: 28;
+        border: solid $primary-darken-2;
+        background: $surface-darken-2;
+        content-align: center middle;
+        margin-left: 1;
+    }
+    #img-hint { color: $text-muted; height: 1; text-align: center; margin-top: 0; }
+    #img-btn-row { align: center middle; height: 3; }
+    #img-btn-row Button { margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("backspace", "go_up", "Parent dir"),
+        Binding("left", "go_up", "Parent dir", show=False),
+    ]
+
+    def __init__(self, start_dir: Path | None = None):
+        super().__init__()
+        self._cwd = (start_dir or Path.cwd()).resolve()
+        self._entries: list[tuple[str, Path]] = []
+
+    def compose(self) -> ComposeResult:
+        with Container(id="img-dialog"):
+            yield Static("", id="img-path")
+            yield Rule()
+            with Horizontal(id="img-body"):
+                yield ListView(id="img-list")
+                yield Static("[dim]select an image[/dim]", id="img-preview", markup=True)
+            yield Static(
+                "[dim]Enter[/dim]=open  [dim]Backspace/←[/dim]=parent  [dim]Esc[/dim]=cancel",
+                id="img-hint",
+                markup=True,
+            )
+            with Horizontal(id="img-btn-row"):
+                yield Button("Select", variant="success", id="img-select")
+                yield Button("Cancel", variant="default", id="img-cancel")
+
+    def on_mount(self):
+        self._do_populate(self._cwd)
+
+    @work(exclusive=True)
+    async def _do_populate(self, directory: Path):
+        self._cwd = directory
+        self.query_one("#img-path", Static).update(f"📁  {directory}")
+        lv = self.query_one("#img-list", ListView)
+        await lv.clear()
+
+        self._entries = []
+        items: list[ListItem] = []
+
+        if directory.parent != directory:
+            self._entries.append(("up", directory.parent))
+            items.append(ListItem(Label(Text("↑  ..", style="bold yellow"))))
+
+        try:
+            children = sorted(
+                directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower())
+            )
+            for d in [p for p in children if p.is_dir() and not p.name.startswith(".")]:
+                self._entries.append(("dir", d))
+                items.append(ListItem(Label(Text(f"📁  {_bidi(d.name)}/"))))
+            for img in [p for p in children if p.is_file() and p.suffix.lower() in IMAGE_EXTS]:
+                size = fmt_size(img.stat().st_size)
+                t = Text(f"🖼  {_bidi(img.name)}")
+                t.append(f"  {size}", style="dim")
+                self._entries.append(("img", img))
+                items.append(ListItem(Label(t)))
+        except PermissionError:
+            items.append(ListItem(Label("[red]  Permission denied[/red]", markup=True)))
+
+        if not items:
+            items.append(ListItem(Label("[dim]  (no images here)[/dim]", markup=True)))
+
+        await lv.mount(*items)
+        self.query_one("#img-preview", Static).update("[dim]select an image[/dim]")
+
+    def _show_preview(self, path: Path | None):
+        preview = self.query_one("#img-preview", Static)
+        if path is None:
+            preview.update("[dim]select an image[/dim]")
+            return
+        if path.suffix.lower() == ".svg":
+            preview.update("[dim]SVG — no preview[/dim]")
+            return
+        art = _render_cover_art(path, width=22, max_rows=12)
+        preview.update(art if art else "[red]preview unavailable[/red]")
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted):
+        if event.list_view.id != "img-list" or event.list_view.index is None:
+            return
+        idx = event.list_view.index
+        if 0 <= idx < len(self._entries):
+            kind, path = self._entries[idx]
+            self._show_preview(path if kind == "img" else None)
+
+    def on_list_view_selected(self, event: ListView.Selected):
+        if event.list_view.id != "img-list":
+            return
+        idx = event.list_view.index
+        if idx is None or idx >= len(self._entries):
+            return
+        kind, path = self._entries[idx]
+        if kind in ("up", "dir"):
+            self._do_populate(path)
+        elif kind == "img":
+            self.dismiss(str(path))
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "img-cancel":
+            self.dismiss(None)
+        elif event.button.id == "img-select":
+            lv = self.query_one("#img-list", ListView)
+            idx = lv.index
+            if idx is not None and 0 <= idx < len(self._entries):
+                kind, path = self._entries[idx]
+                if kind == "img":
+                    self.dismiss(str(path))
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_go_up(self):
+        if self._cwd.parent != self._cwd:
+            self._do_populate(self._cwd.parent)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Modal: Chapter list / reorder
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChapterScreen(ModalScreen[list[str] | None]):
+    CSS = """
+    ChapterScreen { align: center middle; }
+    #chapter-dialog {
+        width: 66;
+        height: auto;
+        max-height: 36;
+        border: thick $success;
+        background: $surface;
+        padding: 1 2;
+    }
+    #chapter-list {
+        height: auto;
+        max-height: 24;
+        border: solid $primary-darken-2;
+        margin: 1 0 0 0;
+        background: $surface-darken-1;
+    }
+    #chapter-list > ListItem { padding: 0 1; }
+    #chapter-list > ListItem.--highlight { background: $primary; color: $text; }
+    #chapter-hint { color: $text-muted; height: 1; text-align: center; margin-top: 0; }
+    #chapter-btn-row { align: center middle; height: 3; }
+    #chapter-btn-row Button { margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("shift+up", "move_up", "Move up"),
+        Binding("shift+down", "move_down", "Move down"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, chapters: list[ChapterInfo]):
+        super().__init__()
+        self._chapters = list(chapters)
+
+    def compose(self) -> ComposeResult:
+        with Container(id="chapter-dialog"):
+            yield Static("[bold]Chapter Order[/bold]", markup=True)
+            yield Rule()
+            yield ListView(id="chapter-list")
+            yield Static(
+                "[dim]Shift+↑↓[/dim]=reorder  [dim]Esc[/dim]=cancel",
+                id="chapter-hint",
+                markup=True,
+            )
+            with Horizontal(id="chapter-btn-row"):
+                yield Button("Save Order", variant="success", id="ch-save")
+                yield Button("Cancel", variant="default", id="ch-cancel")
+
+    def on_mount(self):
+        self._repopulate(0)
+
+    @work(exclusive=True)
+    async def _repopulate(self, restore_idx: int):
+        lv = self.query_one("#chapter-list", ListView)
+        await lv.clear()
+        for i, ch in enumerate(self._chapters, 1):
+            label = _bidi(ch.title if ch.title else ch.idref)
+            t = Text(f" {i:2d}.  ")
+            t.append(label)
+            lv.append(ListItem(Label(t)))
+        if self._chapters:
+            idx = max(0, min(restore_idx, len(self._chapters) - 1))
+            self.call_after_refresh(lambda: setattr(lv, "index", idx))
+
+    def action_move_up(self):
+        lv = self.query_one("#chapter-list", ListView)
+        idx = lv.index
+        if idx is not None and idx > 0:
+            self._chapters[idx], self._chapters[idx - 1] = (
+                self._chapters[idx - 1],
+                self._chapters[idx],
+            )
+            self._repopulate(idx - 1)
+
+    def action_move_down(self):
+        lv = self.query_one("#chapter-list", ListView)
+        idx = lv.index
+        if idx is not None and idx < len(self._chapters) - 1:
+            self._chapters[idx], self._chapters[idx + 1] = (
+                self._chapters[idx + 1],
+                self._chapters[idx],
+            )
+            self._repopulate(idx + 1)
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "ch-save":
+            self.dismiss([ch.idref for ch in self._chapters])
+        elif event.button.id == "ch-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Modal: File browser
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -374,12 +666,12 @@ class FileBrowserScreen(ModalScreen[str | None]):
 
             for d in dirs:
                 self._entries.append(("dir", d))
-                t = Text(f"📁  {d.name}/")
+                t = Text(f"📁  {_bidi(d.name)}/")
                 items.append(ListItem(Label(t)))
 
             for e in epubs:
                 size = fmt_size(e.stat().st_size)
-                t = Text(f"📖  {e.name}")
+                t = Text(f"📖  {_bidi(e.name)}")
                 t.append(f"  {size}", style="dim")
                 self._entries.append(("epub", e))
                 items.append(ListItem(Label(t)))
@@ -494,7 +786,7 @@ class WelcomeScreen(Screen):
             self._local_epubs = [str(e) for e in epubs]
             for epub in epubs:
                 size = fmt_size(epub.stat().st_size)
-                t = Text(f"📖  {epub.name}")
+                t = Text(f"📖  {_bidi(epub.name)}")
                 t.append(f"  {size}", style="dim")
                 lv.append(ListItem(Label(t)))
         else:
@@ -555,29 +847,45 @@ class InfoPanel(Static):
         m = editor.metadata
         t = Table.grid(padding=(0, 1))
         t.add_column(style="bold cyan", min_width=14)
-        t.add_column()
+        t.add_column(max_width=32)
 
         def row(label, val):
             t.add_row(label, str(val) if val else "[dim]—[/dim]")
 
-        # Title: display RTL with bidi mark + right-align when direction is RTL
+        rtl = m.direction == "rtl"
+
         raw_title = m.title or "Unknown"
-        if m.direction == "rtl":
-            title_text = Text("\u202b" + raw_title, justify="right")
-        else:
-            title_text = Text(raw_title)
+        title_text = Text(_bidi(raw_title), justify="right" if rtl else "left")
         t.add_row("Title:", title_text)
 
-        row("Author:", m.author or "Unknown")
+        row("Author:", _bidi(m.author) or "Unknown")
         row("Language:", m.language or "Unknown")
-        row("Publisher:", m.publisher)
-        row("Identifier:", m.identifier[:40] + "…" if len(m.identifier) > 40 else m.identifier)
+        row("Publisher:", _bidi(m.publisher))
+        ident = m.identifier
+        row("Identifier:", (ident[:38] + "…") if len(ident) > 40 else ident)
         row("Direction:", direction_badge(m.direction))
         row("Chapters:", str(editor.get_spine_count()))
         row("File size:", fmt_size(editor.get_file_size()))
-        row("Cover:", "✓ Present" if m.cover_path else "[dim]None[/dim]")
 
-        self.update(Panel(t, title="[bold]Book Info[/bold]", border_style="cyan", box=box.ROUNDED))
+        # Cover art
+        cover_path = editor.get_cover_abs_path()
+        cover_art = _render_cover_art(cover_path) if cover_path else None
+
+        if cover_art:
+            row("Cover:", "✓ Present")
+            outer = Table.grid(padding=(0, 1))
+            outer.add_column(ratio=1)
+            outer.add_column()
+            outer.add_row(
+                t,
+                Panel(cover_art, title="[dim]cover[/dim]", border_style="dim", padding=(0, 0)),
+            )
+            content = outer
+        else:
+            row("Cover:", "[dim]None[/dim]")
+            content = t
+
+        self.update(Panel(content, title="[bold]Book Info[/bold]", border_style="cyan", box=box.ROUNDED))
 
 
 class ActionMenu(ListView):
@@ -587,6 +895,7 @@ class ActionMenu(ListView):
         ("direction", "↔  Reading Direction"),
         ("cover", "🖼  Set Cover Image"),
         ("metadata", "✏  Edit Metadata"),
+        ("chapters", "📑  Chapters"),
         ("theme", "🎨  Theme"),
         ("save", "💾  Save EPUB"),
         ("save-as", "📁  Save As…"),
@@ -659,6 +968,7 @@ class EditorScreen(Screen):
         Binding("d", "direction", "Direction"),
         Binding("c", "cover", "Cover"),
         Binding("m", "metadata", "Metadata"),
+        Binding("l", "chapters", "Chapters"),
         Binding("t", "theme", "Theme"),
         Binding("s", "save", "Save"),
         Binding("S", "save_as", "Save As"),
@@ -713,6 +1023,7 @@ class EditorScreen(Screen):
             "action-direction": self.action_direction,
             "action-cover": self.action_cover,
             "action-metadata": self.action_metadata,
+            "action-chapters": self.action_chapters,
             "action-theme": self.action_theme,
             "action-save": self.action_save,
             "action-save-as": self.action_save_as,
@@ -750,10 +1061,7 @@ class EditorScreen(Screen):
     def action_cover(self):
         if not self._require_editor():
             return
-        self.app.push_screen(
-            FilePathScreen("Set Cover Image", "e.g. /Users/me/cover.jpg"),
-            self._on_cover_path,
-        )
+        self.app.push_screen(ImageBrowserScreen(), self._on_cover_path)
 
     def _on_cover_path(self, path: str | None):
         if not path:
@@ -781,6 +1089,23 @@ class EditorScreen(Screen):
         self._dirty = True
         self._refresh_info()
         self._log("[green]✓ Metadata updated[/green]")
+
+    def action_chapters(self):
+        if not self._require_editor():
+            return
+        chapters = self.editor.get_chapters()
+        if not chapters:
+            self._log("[yellow]No chapters found in spine.[/yellow]")
+            return
+        self.app.push_screen(ChapterScreen(chapters), self._on_chapters_saved)
+
+    def _on_chapters_saved(self, new_order: list[str] | None):
+        if not new_order:
+            return
+        self.editor.reorder_spine(new_order)
+        self._dirty = True
+        self._refresh_info()
+        self._log("[green]✓ Chapter order saved[/green]")
 
     def action_theme(self):
         self.app.push_screen(ThemeScreen(), self._on_theme_selected)

@@ -9,6 +9,7 @@ dependencies = [
     "pillow>=10",
     "lxml>=5",
     "beautifulsoup4>=4.12",
+    "python-bidi>=0.4",
 ]
 
 [project.scripts]
