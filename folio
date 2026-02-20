@@ -1,0 +1,11 @@
+#!/bin/sh
+# Dev launcher for folio.
+# Prefers Homebrew Python (where deps are installed on macOS),
+# falls back to whatever python3 is on PATH.
+# For a proper install, use: pip install -e . && folio
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x /opt/homebrew/bin/python3 ]; then
+    exec /opt/homebrew/bin/python3 "$DIR/main.py" "$@"
+else
+    exec python3 "$DIR/main.py" "$@"
+fi

@@ -1,0 +1,19 @@
+[project]
+name = "folio"
+version = "0.1.0"
+description = "Terminal-native EPUB editor"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=8.0",
+    "rich>=13",
+    "pillow>=10",
+    "lxml>=5",
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+folio = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

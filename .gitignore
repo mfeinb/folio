@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Editors
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Project
+.claude/
+
+# Don't commit test EPUBs
+*.epub
